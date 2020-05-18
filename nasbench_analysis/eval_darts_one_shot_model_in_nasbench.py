@@ -13,6 +13,7 @@ from nasbench_analysis.search_spaces.search_space_2 import SearchSpace2
 from nasbench_analysis.search_spaces.search_space_3 import SearchSpace3
 from nasbench_analysis.utils import get_top_k, INPUT, OUTPUT, CONV1X1, NasbenchWrapper, natural_keys
 from optimizers.darts.genotypes import PRIMITIVES
+import logging
 
 
 # from scipy.special import softmax
@@ -37,7 +38,7 @@ def get_directory_list(path):
     return directory_list
 
 
-def eval_one_shot_model(config, model):
+def eval_one_shot_model(config, model, nasbench_results=None):
     model_list = pickle.load(open(model, 'rb'))
 
     alphas_mixed_op = model_list[0]
@@ -98,12 +99,22 @@ def eval_one_shot_model(config, model):
 
     else:
         raise ValueError('Unknown search space')
+    logging.info('Edges:')
+    logging.info(parents)
+    logging.info('Operations:')
+    logging.info(node_list)
 
     adjacency_matrix = search_space.create_nasbench_adjacency_matrix(parents)
     # Convert the adjacency matrix in format for nasbench
     adjacency_list = adjacency_matrix.astype(np.int).tolist()
     model_spec = api.ModelSpec(matrix=adjacency_list, ops=node_list)
     # Query nasbench
+    if 'nasbench' not in locals():
+        if nasbench_results is not None:
+            nasbench = nasbench_results
+        else:
+            nasbench = NasbenchWrapper(
+                dataset_file='/nasbench_data/nasbench_only108.tfrecord')
     data = nasbench.query(model_spec)
     valid_error, test_error, runtime, params = [], [], [], []
     for item in data:
@@ -117,6 +128,8 @@ def eval_one_shot_model(config, model):
 def eval_directory(path):
     """Evaluates all one-shot architecture methods in the directory."""
     # Read in config
+    nasbench = NasbenchWrapper(
+        dataset_file='/results/nasbench_only108.tfrecord')
     with open(os.path.join(path, 'config.json')) as fp:
         config = json.load(fp)
     # Accumulate all one-shot models
@@ -150,5 +163,5 @@ def main():
 
 if __name__ == '__main__':
     nasbench = NasbenchWrapper(
-        dataset_file='/home/siemsj/projects/darts_weight_sharing_analysis/nasbench_analysis/nasbench_data/108_e/nasbench_full.tfrecord')
+        dataset_file='/results/nasbench_only108.tfrecord')
     main()

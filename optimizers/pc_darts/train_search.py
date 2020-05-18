@@ -20,6 +20,9 @@ from nasbench_analysis.search_spaces.search_space_3 import SearchSpace3
 from optimizers.darts import utils
 from optimizers.darts.architect import Architect
 from optimizers.pc_darts.model_search import PCDARTSNetwork as Network
+from nasbench_analysis import eval_darts_one_shot_model_in_nasbench as naseval
+from nasbench_analysis.utils import NasbenchWrapper
+from optimizers.aws_utils import *
 
 parser = argparse.ArgumentParser("cifar")
 parser.add_argument('--data', type=str, default='../data', help='location of the darts corpus')
@@ -44,11 +47,13 @@ parser.add_argument('--grad_clip', type=float, default=5, help='gradient clippin
 parser.add_argument('--train_portion', type=float, default=0.5, help='portion of training darts')
 parser.add_argument('--unrolled', action='store_true', default=False, help='use one-step unrolled validation loss')
 parser.add_argument('--arch_learning_rate', type=float, default=3e-4, help='learning rate for arch encoding')
+parser.add_argument('--edge_learning_rate', type=float, default=3e-4, help='learning rate for arch encoding')
 parser.add_argument('--arch_weight_decay', type=float, default=1e-3, help='weight decay for arch encoding')
 parser.add_argument('--output_weights', type=bool, default=True, help='Whether to use weights on the output nodes')
 parser.add_argument('--search_space', choices=['1', '2', '3'], default='1')
 parser.add_argument('--warm_start_epochs', type=int, default=0,
                     help='Warm start one-shot model before starting architecture updates.')
+parser.add_argument('--s3_bucket', type=str, default='megadarts', help='s3 bucket for saving to remote')
 args = parser.parse_args()
 
 args.save = 'experiments/pc_darts/search_space_{}/search-{}-{}-{}-{}-{}'.format(args.search_space, args.save,
@@ -133,23 +138,27 @@ def main():
 
     architect = Architect(model, args)
 
+    nasbench = None
+
     for epoch in range(args.epochs):
         scheduler.step()
         lr = scheduler.get_lr()[0]
         logging.info('epoch %d lr %e', epoch, lr)
 
         # Save the one shot model architecture weights for later analysis
-        filehandler = open(os.path.join(args.save, 'one_shot_architecture_{}.obj'.format(epoch)), 'wb')
-        numpy_tensor_list = []
-        for tensor in model.arch_parameters():
-            numpy_tensor_list.append(tensor.detach().cpu().numpy())
-        pickle.dump(numpy_tensor_list, filehandler)
+        arch_filename = os.path.join(args.save, 'one_shot_architecture_{}.obj'.format(epoch))
+        with open(arch_filename, 'wb') as filehandler:
+            numpy_tensor_list = []
+            for tensor in model.arch_parameters():
+                numpy_tensor_list.append(tensor.detach().cpu().numpy())
+            pickle.dump(numpy_tensor_list, filehandler)
 
         # Save the entire one-shot-model
         filepath = os.path.join(args.save, 'one_shot_model_{}.obj'.format(epoch))
         torch.save(model.state_dict(), filepath)
 
-        logging.info('architecture', numpy_tensor_list)
+        logging.info('architecture')
+        logging.info(numpy_tensor_list)
 
         # training
         train_acc, train_obj = train(train_queue, valid_queue, model, architect, criterion, optimizer, lr, epoch)
@@ -160,6 +169,29 @@ def main():
         logging.info('valid_acc %f', valid_acc)
 
         utils.save(model, os.path.join(args.save, 'weights.pt'))
+
+        logging.info('STARTING EVALUATION')
+        if nasbench is None:
+            nasbench = NasbenchWrapper(
+                dataset_file='/nasbench_data/nasbench_only108.tfrecord')
+        test, valid, runtime, params = naseval.eval_one_shot_model(config=args.__dict__,
+                                                                   model=arch_filename,
+                                                                   nasbench_results=nasbench
+                                                                  )
+        index = np.random.choice(list(range(3)))
+        logging.info('TEST ERROR: %.3f | VALID ERROR: %.3f | RUNTIME: %f | PARAMS: %d'
+                     % (test[index],
+                        valid[index],
+                        runtime[index],
+                        params[index])
+                     )
+
+    if args.s3_bucket is not None:
+        for root, dirs, files in os.walk(args.save):
+            for f in files:
+                if 'one_shot_model' not in f:
+                    path = os.path.join(root, f)
+                    upload_to_s3(path, args.s3_bucket, path)
 
 
 def train(train_queue, valid_queue, model, architect, criterion, optimizer, lr, epoch):

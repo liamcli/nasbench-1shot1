@@ -6,6 +6,7 @@ import os
 import pickle
 import sys
 import time
+from copy import deepcopy
 
 import numpy as np
 import torch
@@ -18,17 +19,20 @@ from nasbench_analysis import eval_darts_one_shot_model_in_nasbench as naseval
 from nasbench_analysis.search_spaces.search_space_1 import SearchSpace1
 from nasbench_analysis.search_spaces.search_space_2 import SearchSpace2
 from nasbench_analysis.search_spaces.search_space_3 import SearchSpace3
-from optimizers.darts import utils
-from optimizers.darts.architect import Architect
-from optimizers.darts.model_search import Network
+from nasbench_analysis.utils import NasbenchWrapper
+from optimizers.edarts import utils
+from optimizers.aws_utils import *
+from optimizers.edarts.architect import Architect
+from optimizers.edarts.model_search import Network
 
 parser = argparse.ArgumentParser("cifar")
 parser.add_argument('--data', type=str, default='../data', help='location of the darts corpus')
+parser.add_argument('--s3_bucket', type=str, default='nas-theory', help='s3 bucket name')
 parser.add_argument('--batch_size', type=int, default=96, help='batch size')
 parser.add_argument('--learning_rate', type=float, default=0.025, help='init learning rate')
 parser.add_argument('--learning_rate_min', type=float, default=0.001, help='min learning rate')
 parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
-parser.add_argument('--weight_decay', type=float, default=3e-4, help='weight decay')
+parser.add_argument('--weight_decay', type=float, default=3e-3, help='weight decay')
 parser.add_argument('--report_freq', type=float, default=50, help='report frequency')
 parser.add_argument('--gpu', type=int, default=0, help='gpu device id')
 parser.add_argument('--epochs', type=int, default=50, help='num of training epochs')
@@ -39,16 +43,19 @@ parser.add_argument('--cutout', action='store_true', default=False, help='use cu
 parser.add_argument('--cutout_length', type=int, default=16, help='cutout length')
 parser.add_argument('--cutout_prob', type=float, default=1.0, help='cutout probability')
 parser.add_argument('--drop_path_prob', type=float, default=0.3, help='drop path probability')
+parser.add_argument('--drop_prob', type=float, default=0., help='dropout probability')
 parser.add_argument('--save', type=str, default='EXP', help='experiment name')
 parser.add_argument('--seed', type=int, default=2, help='random_ws seed')
 parser.add_argument('--grad_clip', type=float, default=5, help='gradient clipping')
 parser.add_argument('--train_portion', type=float, default=0.5, help='portion of training darts')
 parser.add_argument('--unrolled', action='store_true', default=False, help='use one-step unrolled validation loss')
-parser.add_argument('--arch_learning_rate', type=float, default=3e-4, help='learning rate for arch encoding')
-parser.add_argument('--arch_weight_decay', type=float, default=1e-3, help='weight decay for arch encoding')
+parser.add_argument('--arch_learning_rate', type=float, default=0.01, help='learning rate for arch encoding')
+parser.add_argument('--edge_learning_rate', type=float, default=0.01, help='learning rate for edge encoding')
+parser.add_argument('--arch_weight_decay', type=float, default=0.01, help='weight decay for arch encoding')
 parser.add_argument('--output_weights', type=bool, default=True, help='Whether to use weights on the output nodes')
 parser.add_argument('--search_space', choices=['1', '2', '3'], default='1')
 parser.add_argument('--debug', action='store_true', default=False, help='run only for some batches')
+parser.add_argument('--single_level', action='store_true', default=False, help='one data split for shared weights and architecture updates')
 parser.add_argument('--warm_start_epochs', type=int, default=0,
                     help='Warm start one-shot model before starting architecture updates.')
 args = parser.parse_args()
@@ -97,12 +104,12 @@ def main():
     cudnn.enabled = True
     torch.cuda.manual_seed(args.seed)
     logging.info('gpu device = %d' % args.gpu)
-    logging.info("args = %s", args)
+    logging.info("args = {}".format(args))
 
     criterion = nn.CrossEntropyLoss()
     criterion = criterion.cuda()
     model = Network(args.init_channels, CIFAR_CLASSES, args.layers, criterion, output_weights=args.output_weights,
-                    steps=search_space.num_intermediate_nodes, search_space=search_space)
+                    steps=search_space.num_intermediate_nodes, search_space=search_space, drop_prob=args.drop_prob)
     model = model.cuda()
     logging.info("param size = %fMB", utils.count_parameters_in_MB(model))
 
@@ -117,22 +124,35 @@ def main():
 
     num_train = len(train_data)
     indices = list(range(num_train))
-    split = int(np.floor(args.train_portion * num_train))
+    if args.single_level:
+        valid_data = deepcopy(train_data)
+        train_queue = torch.utils.data.DataLoader(
+            train_data, batch_size=args.batch_size,
+            sampler=torch.utils.data.sampler.SubsetRandomSampler(indices),
+            pin_memory=True)
 
-    train_queue = torch.utils.data.DataLoader(
-        train_data, batch_size=args.batch_size,
-        sampler=torch.utils.data.sampler.SubsetRandomSampler(indices[:split]),
-        pin_memory=True)
+        valid_queue = torch.utils.data.DataLoader(
+            valid_data, batch_size=args.batch_size,
+            sampler=torch.utils.data.sampler.SubsetRandomSampler(np.random.permutation(indices)),
+            pin_memory=True)
+    else:
+        ind_end = int(np.floor(args.train_portion * num_train))
+        ind_start = ind_end
+        train_queue = torch.utils.data.DataLoader(
+            train_data, batch_size=args.batch_size,
+            sampler=torch.utils.data.sampler.SubsetRandomSampler(indices[:ind_end]),
+            pin_memory=True)
 
-    valid_queue = torch.utils.data.DataLoader(
-        train_data, batch_size=args.batch_size,
-        sampler=torch.utils.data.sampler.SubsetRandomSampler(indices[split:num_train]),
-        pin_memory=True)
+        valid_queue = torch.utils.data.DataLoader(
+            train_data, batch_size=args.batch_size,
+            sampler=torch.utils.data.sampler.SubsetRandomSampler(indices[ind_start:num_train]),
+            pin_memory=True)
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, float(args.epochs), eta_min=args.learning_rate_min)
 
     architect = Architect(model, args)
+    nasbench = None
 
     for epoch in range(args.epochs):
         scheduler.step()
@@ -166,10 +186,16 @@ def main():
         logging.info('valid_acc %f', valid_acc)
 
         utils.save(model, os.path.join(args.save, 'weights.pt'))
+        architect.history.update_history()
 
         logging.info('STARTING EVALUATION')
+        if nasbench is None:
+            nasbench = NasbenchWrapper(
+                dataset_file='/nasbench_data/nasbench_only108.tfrecord')
         test, valid, runtime, params = naseval.eval_one_shot_model(config=args.__dict__,
-                                                                   model=arch_filename)
+                                                                   model=arch_filename,
+                                                                   nasbench_results=nasbench
+                                                                  )
         index = np.random.choice(list(range(3)))
         logging.info('TEST ERROR: %.3f | VALID ERROR: %.3f | RUNTIME: %f | PARAMS: %d'
                      % (test[index],
@@ -177,6 +203,13 @@ def main():
                         runtime[index],
                         params[index])
                      )
+
+    if args.s3_bucket is not None:
+        for root, dirs, files in os.walk(args.save):
+            for f in files:
+                if 'one_shot_model' not in f:
+                    path = os.path.join(root, f)
+                    upload_to_s3(path, args.s3_bucket, path)
 
 
 def train(train_queue, valid_queue, model, architect, criterion, optimizer, lr, epoch):
